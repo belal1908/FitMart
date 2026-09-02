@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { fmt } from "../utils/formatters";
+import { getAuthHeaders } from "../utils/getAuthHeaders";
 import AdminNavbar from "../components/AdminNavbar";
 
 const API_BASE = `${import.meta.env.VITE_API_URL}/api`;
@@ -13,7 +14,7 @@ const SEGMENT_STYLES = {
 };
 
 const CustomerAvatar = ({ name, photoURL, size = 8 }) => (
-  <div className={`w-${size} h-${size} rounded-full overflow-hidden flex-shrink-0
+  <div className={`w-${size} h-${size} rounded-full overflow-hidden shrink-0
                    bg-stone-200 flex items-center justify-center`}>
     {photoURL ? (
       <img src={photoURL} alt={name || "avatar"}
@@ -49,59 +50,162 @@ const Empty = () => (
 );
 
 // ── Mobile customer card ──────────────────────────────────────────────────
-const CustomerMobileCard = ({ c, index, onClick }) => (
-  <div
-    role="button"
-    tabIndex={0}
-    onClick={onClick}
-    onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
-    onMouseDown={(e) => e.preventDefault()}
-    className="select-none flex items-center gap-3 py-3.5 border-b border-stone-100 last:border-0
-               cursor-pointer active:bg-stone-50 transition-colors"
-  >
-    <span className="text-xs text-stone-300 w-5 flex-shrink-0 text-center">{index + 1}</span>
+const CustomerMobileCard = ({ c, index, onClick, onSendReminder, isSending, reminderSent, reminderError }) => (
+  <div className="border-b border-stone-100 last:border-0">
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onClick}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
+      onMouseDown={(e) => e.preventDefault()}
+      className="select-none flex items-center gap-3 py-3.5 cursor-pointer active:bg-stone-50 transition-colors"
+    >
+      <span className="text-xs text-stone-300 w-5 shrink-0 text-center">{index + 1}</span>
 
-    <CustomerAvatar name={c.customerName} photoURL={c.customerPhoto} size={8} />
+      <CustomerAvatar name={c.customerName} photoURL={c.customerPhoto} size={8} />
 
-    <div className="flex-1 min-w-0">
-      <div className="flex items-center gap-2 mb-0.5">
-        {c.customerName && c.customerName !== "—" ? (
-          <p className="text-sm font-medium text-stone-700 truncate">{c.customerName}</p>
-        ) : (
-          <p className="text-xs text-stone-400 font-mono">{c.userId?.slice(0, 12)}…</p>
-        )}
-        <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium capitalize flex-shrink-0
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-0.5">
+          {c.customerName && c.customerName !== "—" ? (
+            <p className="text-sm font-medium text-stone-700 truncate">{c.customerName}</p>
+          ) : (
+            <p className="text-xs text-stone-400 font-mono">{c.userId?.slice(0, 12)}…</p>
+          )}
+          <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium capitalize shrink-0
                           ${SEGMENT_STYLES[c.segment]}`}>
-          {c.segment}
-        </span>
+            {c.segment}
+          </span>
+        </div>
+        {c.customerEmail && c.customerEmail !== "—" && (
+          <p className="text-xs text-stone-400 truncate">{c.customerEmail}</p>
+        )}
       </div>
-      {c.customerEmail && c.customerEmail !== "—" && (
-        <p className="text-xs text-stone-400 truncate">{c.customerEmail}</p>
-      )}
+
+      <div className="text-right shrink-0">
+        <p style={{ fontFamily: "'DM Serif Display', serif" }} className="text-base text-stone-900">
+          {fmt(c.totalSpend)}
+        </p>
+        <p className="text-[10px] text-stone-400 mt-0.5">{c.orderCount} order{c.orderCount !== 1 ? "s" : ""}</p>
+      </div>
     </div>
 
-    <div className="text-right flex-shrink-0">
-      <p style={{ fontFamily: "'DM Serif Display', serif" }} className="text-base text-stone-900">
-        {fmt(c.totalSpend)}
-      </p>
-      <p className="text-[10px] text-stone-400 mt-0.5">{c.orderCount} order{c.orderCount !== 1 ? "s" : ""}</p>
+    {/* Mobile reminder action row */}
+    <div className="px-4 py-2 bg-stone-50 border-t border-stone-100">
+      {reminderSent[c.userId] ? (
+        <span className="text-xs text-stone-400">✓ Reminder sent</span>
+      ) : reminderError[c.userId] ? (
+        <p className="text-xs text-red-600">{reminderError[c.userId]}</p>
+      ) : (
+        <button
+          onClick={(e) => onSendReminder(e, c.userId)}
+          disabled={!c.eligibleForReminder || isSending === c.userId}
+          title={!c.eligibleForReminder ? `Customer must be inactive for 30+ days (currently ${c.daysSinceLastOrder} days)` : "Send reminder email to inactive customer"}
+          className={`w-full px-3 py-1.5 text-xs font-medium rounded-lg transition-all
+                      ${c.eligibleForReminder
+              ? "bg-stone-900 text-white hover:bg-stone-800 cursor-pointer"
+              : "bg-stone-200 text-stone-400 cursor-default opacity-60"
+            }`}
+        >
+          {isSending === c.userId ? "Sending..." : "Send Reminder"}
+        </button>
+      )}
     </div>
   </div>
 );
+
+const PAGE_LIMIT = 50;
 
 export default function AdminCustomers() {
   const [customers, setCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [page, setPage] = useState(1);
+  const [totalCustomers, setTotalCustomers] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const [sendingReminderId, setSendingReminderId] = useState(null);
+  const [reminderSent, setReminderSent] = useState({});
+  const [reminderError, setReminderError] = useState({});
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
 
+  // Scroll to top and reset loading state when page changes
   useEffect(() => {
-    fetch(`${API_BASE}/customers`)
-      .then(res => res.json())
-      .then(json => { setCustomers(json.data); setLoading(false); })
-      .catch(() => { setError("Failed to load customers"); setLoading(false); });
-  }, []);
+    (async () => {
+      try {
+        setLoading(true);
+        setError(null);
+        const headers = await getAuthHeaders();
+        const res = await fetch(`${API_BASE}/customers?page=${page}&limit=${PAGE_LIMIT}`, { headers });
+        const json = await res.json();
+        if (!json.success) {
+          throw new Error(json.error || "Failed to load customers");
+        }
+        setCustomers(json.data || []);
+        setTotalCustomers(json.pagination?.total || 0);
+        setTotalPages(json.pagination?.totalPages || 0);
+        setLoading(false);
+      } catch (err) {
+        console.error("Customers fetch error:", err);
+        setError(err.message || "Failed to load customers");
+        setLoading(false);
+      }
+    })();
+  }, [page]);
+
+  const handlePageChange = (newPage) => {
+    if (newPage < 1 || newPage > totalPages) return;
+    setPage(newPage);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  // Send reminder email for a customer
+  const handleSendReminder = async (e, customerId) => {
+    e.stopPropagation();
+    setSendingReminderId(customerId);
+
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(`${API_BASE}/customers/${customerId}/send-reminder`, {
+        method: "POST",
+        headers,
+        credentials: "include",
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        setReminderError(prev => ({ ...prev, [customerId]: data.error || "Failed to send" }));
+        setSendingReminderId(null);
+        return;
+      }
+
+      setReminderSent(prev => ({ ...prev, [customerId]: true }));
+      setReminderError(prev => ({ ...prev, [customerId]: null }));
+
+      // Update customer data to show latest reminder sent time
+      setCustomers(prev => prev.map(c =>
+        c.userId === customerId
+          ? { ...c, lastReminderEmailSentAt: new Date().toISOString() }
+          : c
+      ));
+
+      // Clear success message after 3 seconds
+      setTimeout(() => {
+        setReminderSent(prev => ({ ...prev, [customerId]: false }));
+      }, 3000);
+    } catch (err) {
+      setReminderError(prev => ({ ...prev, [customerId]: err.message }));
+    } finally {
+      setSendingReminderId(null);
+    }
+  };
+
+  // Derived metrics for visualizations
+  const segmentCounts = customers.reduce((acc, c) => {
+    acc[c.segment] = (acc[c.segment] || 0) + 1;
+    return acc;
+  }, {});
+  const topBySpend = [...customers].sort((a, b) => b.totalSpend - a.totalSpend).slice(0, 5);
 
   return (
     <div className="min-h-screen bg-stone-50" style={{ fontFamily: "'DM Sans', sans-serif" }}>
@@ -133,7 +237,7 @@ export default function AdminCustomers() {
         {/* KPI Cards — single col on mobile, 3-col on sm+ */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 md:gap-5 mb-8 sm:mb-10">
           {[
-            { label: "Total Customers", value: customers.length, icon: "◎" },
+            { label: "Total Customers", value: totalCustomers, icon: "◎" },
             { label: "High Value", value: customers.filter(c => c.segment === "high-value").length, icon: "⭑" },
             { label: "New Customers", value: customers.filter(c => c.segment === "new").length, icon: "+" },
           ].map(({ label, value, icon }) => (
@@ -156,6 +260,59 @@ export default function AdminCustomers() {
           ))}
         </div>
 
+        {/* Insights — simple visuals */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8 sm:mb-10">
+          <div className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-7 hover:border-stone-300 hover:shadow-lg transition-all duration-300">
+            <p className="text-xs tracking-[0.2em] uppercase text-stone-400 mb-4">Insights</p>
+            <h3 style={{ fontFamily: "'DM Serif Display', serif" }} className="text-lg text-stone-900 mb-4">Segment distribution</h3>
+            <div className="space-y-3">
+              {['high-value', 'returning', 'new'].map(seg => {
+                const count = segmentCounts[seg] || 0;
+                const pct = customers.length ? Math.round((count / customers.length) * 100) : 0;
+                return (
+                  <div key={seg} className="flex items-center gap-3">
+                    <div className={`w-3 h-3 rounded-full ${seg === 'high-value' ? 'bg-stone-900' : seg === 'returning' ? 'bg-stone-100 border border-stone-300' : 'bg-stone-100'}`} />
+                    <div className="flex-1">
+                      <div className="flex justify-between mb-1">
+                        <span className="text-xs text-stone-600 capitalize">{seg.replace('-', ' ')}</span>
+                        <span className="text-xs text-stone-400">{count} ({pct}%)</span>
+                      </div>
+                      <div className="w-full h-2 bg-stone-100 rounded-full overflow-hidden">
+                        <div style={{ width: `${pct}%` }} className="h-2 bg-stone-900" />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-7 hover:border-stone-300 hover:shadow-lg transition-all duration-300">
+            <p className="text-xs tracking-[0.2em] uppercase text-stone-400 mb-4">Top customers</p>
+            <h3 style={{ fontFamily: "'DM Serif Display', serif" }} className="text-lg text-stone-900 mb-4">Top spenders</h3>
+            <div className="space-y-3">
+              {topBySpend.length === 0 && <p className="text-xs text-stone-400">No data yet</p>}
+              {topBySpend.map((c, i) => {
+                const pct = customers.length ? Math.round((c.totalSpend / (topBySpend[0]?.totalSpend || 1)) * 100) : 0;
+                return (
+                  <div key={c.userId} className="flex items-center gap-3">
+                    <span className="text-xs text-stone-300 w-5">#{i + 1}</span>
+                    <div className="flex-1">
+                      <div className="flex justify-between mb-1">
+                        <span className="text-sm text-stone-700 truncate">{c.customerName && c.customerName !== '—' ? c.customerName : c.userId}</span>
+                        <span className="text-xs text-stone-400">{fmt(c.totalSpend)}</span>
+                      </div>
+                      <div className="w-full h-2 bg-stone-100 rounded-full overflow-hidden">
+                        <div style={{ width: `${pct}%` }} className="h-2 bg-stone-900" />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
         {/* Customer list card */}
         <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden
                         hover:border-stone-300 transition-all duration-300">
@@ -167,7 +324,12 @@ export default function AdminCustomers() {
                 All Customers
               </h2>
             </div>
-            {!loading && <p className="text-xs text-stone-400">{customers.length} customers</p>}
+            {!loading && (
+              <p className="text-xs text-stone-400">
+                {totalCustomers} customer{totalCustomers !== 1 ? "s" : ""}
+                {totalPages > 1 && <span className="text-stone-300"> &middot; Page {page} of {totalPages}</span>}
+              </p>
+            )}
           </div>
 
           {/* Mobile card list */}
@@ -190,6 +352,10 @@ export default function AdminCustomers() {
                 c={c}
                 index={index}
                 onClick={() => navigate(`/admin/customers/${c.userId}`)}
+                onSendReminder={handleSendReminder}
+                isSending={sendingReminderId}
+                reminderSent={reminderSent}
+                reminderError={reminderError}
               />
             ))}
           </div>
@@ -199,7 +365,7 @@ export default function AdminCustomers() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-stone-100">
-                  {["#", "Customer", "Email", "Orders", "Total Spend", "Segment", "Last Order"].map((h, i) => (
+                  {["#", "Customer", "Email", "Orders", "Total Spend", "Segment", "Last Order", "Notify"].map((h, i) => (
                     <th key={h}
                       className={`px-6 py-4 text-xs tracking-[0.15em] uppercase text-stone-400
                                   font-normal whitespace-nowrap
@@ -269,11 +435,83 @@ export default function AdminCustomers() {
                         day: "2-digit", month: "short", year: "numeric",
                       })}
                     </td>
+                    <td className="px-6 py-5 text-center">
+                      {reminderSent[c.userId] ? (
+                        <span className="text-xs text-stone-400">✓ Sent</span>
+                      ) : reminderError[c.userId] ? (
+                        <div className="text-xs text-red-600 max-w-xs">
+                          <p className="font-medium">{reminderError[c.userId]}</p>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={(e) => handleSendReminder(e, c.userId)}
+                          disabled={!c.eligibleForReminder || sendingReminderId === c.userId}
+                          title={!c.eligibleForReminder ? `Customer must be inactive for 30+ days (currently ${c.daysSinceLastOrder} days)` : "Send reminder email to customer"}
+                          className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-all duration-200
+                                      ${c.eligibleForReminder
+                              ? "bg-stone-900 text-white hover:bg-stone-800 active:scale-95 cursor-pointer"
+                              : "bg-stone-100 text-stone-400 cursor-default opacity-60"
+                            }
+                                      ${sendingReminderId === c.userId ? "opacity-60" : ""}`}
+                        >
+                          {sendingReminderId === c.userId ? "Sending..." : "Send"}
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+
+          {/* Pagination controls */}
+          {!loading && totalPages > 1 && (
+            <div className="flex items-center justify-between px-4 sm:px-7 py-4 border-t border-stone-100">
+              <p className="text-xs text-stone-400 hidden sm:block">
+                Showing page {page} of {totalPages} ({totalCustomers} total customers)
+              </p>
+              <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
+                <button
+                  onClick={() => handlePageChange(page - 1)}
+                  disabled={page === 1}
+                  className="px-3 sm:px-4 py-1.5 text-xs font-medium rounded-lg
+                             bg-stone-100 text-stone-600
+                             hover:bg-stone-200 disabled:opacity-40 disabled:cursor-not-allowed
+                             transition-all active:scale-95"
+                >
+                  Previous
+                </button>
+
+                {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+                  const pageNum = i + 1;
+                  return (
+                    <button
+                      key={pageNum}
+                      onClick={() => handlePageChange(pageNum)}
+                      className={`w-8 h-8 text-xs font-medium rounded-lg transition-all hidden sm:inline-block ${
+                        pageNum === page
+                          ? "bg-stone-900 text-white"
+                          : "bg-stone-100 text-stone-600 hover:bg-stone-200"
+                      }`}
+                    >
+                      {pageNum}
+                    </button>
+                  );
+                })}
+
+                <button
+                  onClick={() => handlePageChange(page + 1)}
+                  disabled={page === totalPages}
+                  className="px-3 sm:px-4 py-1.5 text-xs font-medium rounded-lg
+                             bg-stone-100 text-stone-600
+                             hover:bg-stone-200 disabled:opacity-40 disabled:cursor-not-allowed
+                             transition-all active:scale-95"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

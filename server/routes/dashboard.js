@@ -1,40 +1,36 @@
 // server/routes/dashboard.js
+
+const { LOW_STOCK_THRESHOLD } = require('../config/constants');
 const express = require('express');
 const router = express.Router();
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const admin = require('../firebaseAdmin');
+const verifyFirebaseToken = require('../middleware/verifyFirebaseToken');
+const verifyAdmin = require('../middleware/verifyAdmin');
+const resolveFirebaseUser = require('../lib/resolveFirebaseUser');
 
-// ── Helper: resolve Firebase UID → { displayName, email } ─────────────────
-// Returns "—" gracefully if user is deleted or UID is invalid
-async function resolveFirebaseUser(uid) {
-  try {
-    const userRecord = await admin.auth().getUser(uid);
-    return {
-      displayName: userRecord.displayName || "—",
-      email: userRecord.email || "—",
-      photoURL: userRecord.photoURL || null,
-    };
-  } catch {
-    return { displayName: "—", email: "—" };
-  }
-}
-
-// ── Helper: get the start date based on the time range filter ─────────────
+// ── Helper: get the start date based on the time range filter
+// 'today'  -> start of today
+// 'week'   -> last 7 days (including today)
+// 'month'  -> last 30 days (including today)
 const getStartDate = (range) => {
   const now = new Date();
   if (range === 'today') {
     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  } else if (range === 'week') {
-    const diff = now.getDate() - now.getDay();
-    return new Date(now.getFullYear(), now.getMonth(), diff);
-  } else {
-    return new Date(now.getFullYear(), now.getMonth(), 1);
   }
+
+  // For 'week' and 'month' return a start date N days before today (inclusive)
+  const daysBack = range === 'week' ? 6 : 29; // 6 -> previous 6 days + today = 7 days; 29 -> 30 days
+  const d = new Date(now);
+  d.setDate(now.getDate() - daysBack);
+  d.setHours(0, 0, 0, 0);
+  return d;
 };
 
 // GET /api/dashboard?range=today|week|month
-router.get('/', async (req, res) => {
+// Admin-only dashboard metrics
+router.get('/', verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const range = req.query.range || 'month';
     const startDate = getStartDate(range);
@@ -56,7 +52,7 @@ router.get('/', async (req, res) => {
     const totalCustomers = uniqueCustomers.length;
 
     // ── 3. KPI: Products Low on Stock ─────────────────────────────────────
-    const LOW_STOCK_THRESHOLD = 10;
+    
     const lowStockCount = await Product.countDocuments({
       stock: { $ne: null, $lt: LOW_STOCK_THRESHOLD },
     });

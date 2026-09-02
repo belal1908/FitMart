@@ -3,20 +3,75 @@ const router = express.Router();
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
 const verifyFirebaseToken = require('../middleware/verifyFirebaseToken');
+const validateRequest = require('../middleware/validateRequest');
+const { cartAddSchema, cartRemoveSchema } = require('../validation/requestSchemas');
+const { fail } = require('../utils/apiResponse');
+/**
+ * Atomically adjusts Product.reserved by `delta` using a single findOneAndUpdate.
+ *
+ * Invariants enforced at the DB level:
+ *   - reserved + delta >= 0  (reserved never goes negative)
+ *   - reserved + delta <= stock  (never exceeds finite stock)
+ *
+ * Throws if the product is not found or if either invariant would be violated.
+ *
+ * @param {number}          productId - The product's numeric productId field
+ * @param {number}          delta     - Amount to add (positive) or subtract (negative)
+ * @param {ClientSession|null} [session=null] - Optional Mongoose session for transaction support
+ * @returns {Promise<Product>} The updated product document
+ */
+// Atomic: check + increment happen in one findOneAndUpdate — no separate read needed.
+async function adjustReserved(productId, delta, session = null) {
+  // Always enforce: reserved + delta must be >= 0
+  const filter = {
+    productId: Number(productId),
+    $expr: {
+      $gte: [
+        { $add: [{ $ifNull: ['$reserved', 0] }, delta] },
+        0,
+      ],
+    },
+  };
 
-// Helper: adjust product reserved count
-async function adjustReserved(productId, delta) {
-  const prod = await Product.findOne({ productId: Number(productId) });
-  if (!prod) throw new Error('Product not found');
-  prod.reserved = Math.max(0, (prod.reserved || 0) + delta);
-  await prod.save();
-  return prod;
+  // When adding to reserved, also enforce: reserved + delta must be <= stock
+  // Skip this cap for unlimited products (stock === null)
+  if (delta > 0) {
+    filter.$or = [
+      { stock: null },
+      {
+        $expr: {
+          $lte: [
+            { $add: [{ $ifNull: ['$reserved', 0] }, delta] },
+            '$stock',
+          ],
+        },
+      },
+    ];
+  }
+
+  const updated = await Product.findOneAndUpdate(
+    filter,
+    { $inc: { reserved: delta } },
+    {
+      returnDocument: 'after',
+      ...(session ? { session } : {}),
+    }
+  );
+
+  if (!updated) {
+    const reason = delta > 0
+      ? 'insufficient stock or product not found'
+      : 'reserved count cannot drop below zero or product not found';
+    throw new Error(`Failed to adjust reserved stock: ${reason}`);
+  }
+
+  return updated;
 }
 
 // Helper: check that the token uid matches the userId in the route
 function checkOwnership(req, res) {
   if (req.user.uid !== req.params.userId) {
-    res.status(403).json({ error: 'Forbidden — you can only access your own cart' });
+    fail(res, 'Forbidden — you can only access your own cart', 403);
     return false;
   }
   return true;
@@ -38,7 +93,7 @@ router.get('/:userId', verifyFirebaseToken, async (req, res) => {
     }
     res.json(cart);
   } catch (err) {
-    res.status(500).json({ error: 'Server error' });
+    fail(res, 'Server error', 500);
   }
 });
 
@@ -47,22 +102,21 @@ router.get('/:userId', verifyFirebaseToken, async (req, res) => {
  * @desc    Add an item to the user's cart and reserve stock; body: { productId, quantity }
  * @access  Private
  */
-router.post('/:userId/add', verifyFirebaseToken, async (req, res) => {
+
+router.post('/:userId/add', verifyFirebaseToken,validateRequest(cartAddSchema), async (req, res) => {
   if (!checkOwnership(req, res)) return;
 
   try {
     const { userId } = req.params;
-    const { productId, quantity } = req.body;
-    if (productId == null || quantity == null) return res.status(400).json({ error: 'productId and quantity required' });
 
-    const qty = Number(quantity);
-    if (Number.isNaN(qty) || qty <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
+// Zod already guarantees these are valid numbers
+    const { productId, quantity: qty } = req.body;
 
     const product = await Product.findOne({ productId: Number(productId) });
-    if (!product) return res.status(404).json({ error: 'Product not found' });
+    if (!product) return fail(res, 'Product not found', 404);
 
     const available = product.stock == null ? Infinity : (product.stock - (product.reserved || 0));
-    if (available < qty) return res.status(400).json({ error: 'Insufficient stock available' });
+    if (available < qty) return fail(res, 'Insufficient stock available');
 
     let cart = await Cart.findOne({ userId });
     if (!cart) cart = new Cart({ userId, items: [] });
@@ -80,7 +134,7 @@ router.post('/:userId/add', verifyFirebaseToken, async (req, res) => {
     res.json(fresh);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    fail(res, 'Server error', 500);
   }
 });
 
@@ -89,19 +143,15 @@ router.post('/:userId/add', verifyFirebaseToken, async (req, res) => {
  * @desc    Remove an item (or reduce its quantity) from the user's cart and release reserved stock; body: { productId, quantity }
  * @access  Private
  */
-router.post('/:userId/remove', verifyFirebaseToken, async (req, res) => {
+router.post('/:userId/remove', verifyFirebaseToken,validateRequest(cartRemoveSchema), async (req, res) => {
   if (!checkOwnership(req, res)) return;
 
   try {
     const { userId } = req.params;
-    const { productId, quantity } = req.body;
-    if (productId == null || quantity == null) return res.status(400).json({ error: 'productId and quantity required' });
-
-    const qty = Number(quantity);
-    if (Number.isNaN(qty) || qty <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
-
+    // Zod already guarantees these are valid numbers
+    const { productId, quantity:qty } = req.body;
     const cart = await Cart.findOne({ userId });
-    if (!cart) return res.status(404).json({ error: 'Cart not found' });
+    if (!cart) return fail(res, 'Cart not found', 404);
 
     const itemIdx = cart.items.findIndex(i => i.productId === Number(productId));
     if (itemIdx === -1) return res.status(404).json({ error: 'Item not in cart' });
@@ -116,7 +166,7 @@ router.post('/:userId/remove', verifyFirebaseToken, async (req, res) => {
     res.json(fresh);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    fail(res, 'Server error', 500);
   }
 });
 
@@ -131,7 +181,7 @@ router.delete('/:userId', verifyFirebaseToken, async (req, res) => {
   try {
     const { userId } = req.params;
     const cart = await Cart.findOne({ userId });
-    if (!cart) return res.status(404).json({ error: 'Cart not found' });
+    if (!cart) return fail(res, 'Cart not found', 404);
 
     for (const item of cart.items) {
       await adjustReserved(item.productId, -item.quantity);
@@ -142,8 +192,10 @@ router.delete('/:userId', verifyFirebaseToken, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    fail(res, 'Server error', 500);
   }
 });
 
 module.exports = router;
+// Named export for integration tests (server/tests/cart.reserved.test.js)
+module.exports.adjustReserved = adjustReserved;
